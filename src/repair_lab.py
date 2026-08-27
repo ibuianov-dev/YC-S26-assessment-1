@@ -56,12 +56,12 @@ class TargetAccountTool:
 def _entity_key(row: dict[str, Any]) -> str:
     """Identity used to decide whether two rows name the same thing.
 
-    Rows sharing a real company_id collapse into one. A missing company_id
-    is never assumed to match another missing one, so it's keyed by the
-    row's own id instead.
+    Rows sharing a real company_id collapse into one. A missing or blank
+    company_id is never assumed to match another missing/blank one, so
+    it's keyed by the row's own id instead.
     """
     company_id = row.get("company_id")
-    if company_id is None:
+    if not company_id:
         return f"unresolved:{row['id']}"
     return f"company:{company_id}"
 
@@ -196,7 +196,7 @@ def evaluate_campaign_coverage(
         return False, "plan does not record which brand kit/template were requested"
 
     def entity_key(company_id: Any, source_row_id: Any) -> str:
-        if company_id is None:
+        if not company_id:
             return f"unresolved:{source_row_id}"
         return f"company:{company_id}"
 
