@@ -53,19 +53,30 @@ class TargetAccountTool:
         )
 
 
-def _collapse_page(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse rows that name the same company.
+def _entity_key(row: dict[str, Any]) -> str:
+    """Identity used to decide whether two rows name the same thing.
 
-    The uploaded list can name a company more than once, so the page is
-    reduced to one row per company before anything downstream sees it.
+    Rows sharing a real company_id collapse into one. A missing company_id
+    is never assumed to match another missing one, so it's keyed by the
+    row's own id instead.
     """
+    company_id = row.get("company_id")
+    if company_id is None:
+        return f"unresolved:{row['id']}"
+    return f"company:{company_id}"
+
+
+def _dedupe_rows(
+    rows: list[dict[str, Any]], seen: set[str]
+) -> list[dict[str, Any]]:
+    """Drop rows already kept, across every page of this read (`seen` is
+    shared across the whole `build_campaign_plan` call)."""
     kept: list[dict[str, Any]] = []
-    seen: set[str] = set()
     for row in rows:
-        company_id = str(row["company_id"])
-        if company_id in seen:
+        key = _entity_key(row)
+        if key in seen:
             continue
-        seen.add(company_id)
+        seen.add(key)
         kept.append(row)
     return kept
 
@@ -76,26 +87,37 @@ def _make_deliverables(
     brand_kit_id: str,
     template_id: str,
 ) -> list[dict[str, str]]:
-    deliverables: list[dict[str, str]] = []
+    """Build the four required assets for each account, using the brand
+    kit/template selected on *this* request (never a saved one from an
+    earlier campaign)."""
+    deliverables: list[dict[str, Any]] = []
     for account in accounts:
-        effective_brand_kit = str(
-            account.get("saved_brand_kit_id", brand_kit_id)
-        )
-        effective_template = str(
-            account.get("saved_template_id", template_id)
-        )
+        company_id = account.get("company_id")
         for asset_type in REQUIRED_ASSET_TYPES:
             deliverables.append(
                 {
                     "source_row_id": str(account["id"]),
-                    "company_id": str(account["company_id"]),
+                    "company_id": str(company_id) if company_id is not None else None,
                     "company_name": str(account["company_name"]),
                     "asset_type": asset_type,
-                    "brand_kit_id": effective_brand_kit,
-                    "template_id": effective_template,
+                    "brand_kit_id": brand_kit_id,
+                    "template_id": template_id,
                 }
             )
     return deliverables
+
+
+class PaginationStalledError(RuntimeError):
+    """Raised when the account service stops making real progress (frozen
+    or cycling cursor, or a page claiming more data with no way to reach
+    it). We refuse to publish a partial or looping plan."""
+
+
+MAX_PAGE_FETCHES = 500
+# One page is allowed to come back twice in a row (an upstream retry
+# replaying the same response) without it counting as stalled. A third
+# time asking for the same cursor is not a retry anymore.
+MAX_CURSOR_REPEATS = 2
 
 
 def build_campaign_plan(
@@ -106,12 +128,40 @@ def build_campaign_plan(
     page_size: int = 25,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
+    seen_entities: set[str] = set()
+    cursor_uses: dict[str, int] = {}
     cursor: str | None = None
+    fetches = 0
+
     while True:
+        fetches += 1
+        if fetches > MAX_PAGE_FETCHES:
+            raise PaginationStalledError(
+                f"account service had not finished after {MAX_PAGE_FETCHES} "
+                "page fetches; refusing to publish a plan that may be "
+                "incomplete or looping"
+            )
+
+        cursor_token = cursor if cursor is not None else "<start>"
+        cursor_uses[cursor_token] = cursor_uses.get(cursor_token, 0) + 1
+        if cursor_uses[cursor_token] > MAX_CURSOR_REPEATS:
+            raise PaginationStalledError(
+                f"account service returned cursor {cursor_token!r} "
+                f"{cursor_uses[cursor_token]} times without making "
+                "progress; refusing to loop forever"
+            )
+
         page = tool.load_page(cursor=cursor, page_size=page_size)
-        rows.extend(_collapse_page(page.rows))
+        rows.extend(_dedupe_rows(page.rows, seen_entities))
+
         if not page.truncated:
             break
+
+        if page.next_cursor is None:
+            raise PaginationStalledError(
+                "account service reported more data (truncated=True) but "
+                "supplied no cursor to continue from"
+            )
         cursor = page.next_cursor
 
     return {
@@ -121,9 +171,7 @@ def build_campaign_plan(
             brand_kit_id=brand_kit_id,
             template_id=template_id,
         ),
-        # The brand kit/template actually requested, so a coverage check can
-        # tell "built with what was asked for" from "built with something
-        # else" without having to be handed the request separately.
+        # Recorded so coverage checks can verify against what was requested.
         "brand_kit_id": brand_kit_id,
         "template_id": template_id,
         "complete": True,
@@ -134,24 +182,12 @@ def evaluate_campaign_coverage(
     plan: dict[str, Any],
     accounts: list[dict[str, Any]],
 ) -> tuple[bool, str]:
-    """Strict coverage check, verified against the uploaded accounts.
+    """Strict coverage check, verified against the uploaded accounts rather
+    than just asking the plan whether it agrees with itself.
 
-    Unlike the original check, this does not just ask the plan whether it
-    agrees with itself. It rebuilds the set of companies the upload actually
-    requires and requires the plan to match it exactly:
-
-    - every real company_id in the upload must appear in the plan. Rows
-      sharing a company_id collapse into one expected company, same as the
-      builder does.
-    - a row with a missing/null company_id can never be merged with any
-      other row - each one is its own unresolved entity, keyed by its own
-      source_row_id, and must be accounted for on its own.
-    - each expected entity must have exactly the four required asset types,
-      no duplicates and nothing missing.
-    - every deliverable for that entity must carry the brand kit and
-      template actually requested on this campaign - a saved per-account
-      preference from a previous campaign does not override what the
-      customer selected this time.
+    Requires: every expected entity (same company_id/unresolved-row keying
+    as the builder) is present with exactly the 4 required asset types and
+    the brand kit/template actually requested on this campaign.
     """
     deliverables = plan.get("deliverables", [])
     expected_brand_kit = plan.get("brand_kit_id")
