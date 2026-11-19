@@ -1,4 +1,4 @@
-# CharacterQuilt technical screen: audit a campaign you cannot check by hand
+# Technical screen: audit a campaign you cannot check by hand
 
 Read [TASK.md](TASK.md) — it has the whole assignment.
 
